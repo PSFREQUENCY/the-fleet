@@ -1,0 +1,4 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-f', 'Dockerfile.worker', '-t', 'gcr.io/living-swarm-prod/fleet-worker:latest', '.']
+images: ['gcr.io/living-swarm-prod/fleet-worker:latest']
