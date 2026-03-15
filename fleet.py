@@ -597,19 +597,28 @@ def main() -> None:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
+    _tasks: list = []
+
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands(
             [BotCommand(cmd, desc) for cmd, _, desc in CMD_MAP]
         )
-        asyncio.ensure_future(pulse.start())
-        asyncio.ensure_future(_check_wake_file())
-        # Startup learning cycle — catch up on offline time
+        _tasks.append(asyncio.ensure_future(pulse.start()))
+        _tasks.append(asyncio.ensure_future(_check_wake_file()))
         if offline_sec > 60:
             log.info(f"Running startup wake cycle ({offline_sec/3600:.1f}h offline)")
             asyncio.ensure_future(_wake_cycle(offline_sec))
         log.info(f"Fleet online — gen:{skills.generation}  mem:{len(cortex.nodes)}")
 
-    app.post_init = post_init
+    async def post_shutdown(application: Application) -> None:
+        pulse.stop()
+        for t in _tasks:
+            t.cancel()
+        _save()
+        log.info("Fleet shutdown — state saved")
+
+    app.post_init     = post_init
+    app.post_shutdown = post_shutdown
     app.run_polling(drop_pending_updates=True)
 
 
