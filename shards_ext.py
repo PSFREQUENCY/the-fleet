@@ -636,44 +636,84 @@ def _decide_attack(da_groups, my_hp, op_hp, my_idx, op_c, danger, aggro, edge_mo
     return send if send else None
 
 
-# ── Turn builder ──────────────────────────────────────────────────────────────
-def _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
-                my_pid, op_pid, danger, aggro, edge_mode, momentum, stall):
-    parsed   = _parse_legal(lg)
-    nm       = parsed.get("_name_map", {})
-    end_turn = _make_pass(parsed["end_turn_code"])
+# ── Turn builder — works directly with API action objects ─────────────────────
+_SUBMIT_SKIP = frozenset(("code", "description"))
 
-    if parsed["mulligan_keep"] or parsed["mulligan_pass"]:
+def _build_turn(lg: list, state: dict, player_id: str,
+                danger: int, aggro: int, edge_mode: str, momentum: str, stall: bool) -> list:
+    """Select and return actions from legal action objects (no code reparsing)."""
+    _clean = lambda a: {k: v for k, v in a.items() if k not in _SUBMIT_SKIP}
+
+    by_type: dict = {}
+    for a in lg:
+        if isinstance(a, dict):
+            by_type.setdefault(a.get("type", ""), []).append(a)
+
+    phase  = _get_phase(state)
+    me     = state.get("me", {}); op  = state.get("op", {})
+    my_c   = _extract_creatures(me); op_c = _extract_creatures(op)
+    hand   = _extract_hand(me)
+    my_idx = _build_index(my_c);     op_idx = _build_index(op_c)
+    my_hp  = me.get("hp", 30);       op_hp  = op.get("hp", 30)
+    op_pid = "p2" if player_id == "p1" else "p1"
+
+    # Name map from descriptions ("Play Isolation Protocol" → "Isolation Protocol")
+    nm = {a["card_instance_id"]: a["description"][5:]
+          for a in lg if isinstance(a, dict)
+          and a.get("type") == "play_card"
+          and a.get("card_instance_id")
+          and str(a.get("description", "")).startswith("Play ")}
+
+    # MULLIGAN
+    if "mulligan" in by_type:
         return [{"type": "mulligan", "keep": _should_keep(hand)}]
 
-    my_idx = _build_index(my_c)
-    op_idx = _build_index(op_c)
+    # BLOCKING PHASE — parse DB pairs from code strings in objects
+    if "BLOCK" in phase.upper() and "declare_blockers" in by_type:
+        db_pairs = []
+        for a in by_type["declare_blockers"]:
+            c = a.get("code", "")
+            if c.startswith("DB:"):
+                parts = c[3:].split(">", 1)
+                if len(parts) == 2:
+                    db_pairs.append((parts[0], parts[1]))  # (attacker, blocker)
+        blocks = _decide_blocks(db_pairs, my_hp, my_idx, op_idx, danger, edge_mode)
+        return [{"type": "declare_blockers", "blocks": blocks}]
 
-    if "BLOCK" in phase.upper():
-        blocks = _decide_blocks(parsed["db_pairs"], my_hp, my_idx, op_idx, danger, edge_mode)
-        return [{"type": "declare_blockers", "blocks": blocks}, end_turn]
-
+    # MAIN PHASE
     actions   = []
-    my_atk_pw = (sum(_cpow(my_idx.get(a, {})) for g in parsed["da_groups"] for a in g)
-                 if parsed["da_groups"] else sum(_cpow(c) for c in my_c))
-
-    spell_dmg    = sum(lookup_card(_cname(c, nm)).get("value", 2) for c in hand
-                       if lookup_card(_cname(c, nm))["role"] == "damage_spell")
+    my_atk_pw = sum(_cpow(c) for c in my_c)
+    spell_dmg = sum(lookup_card(nm.get(_cid(c), _cname(c, nm))).get("value", 2)
+                    for c in hand
+                    if lookup_card(nm.get(_cid(c), _cname(c, nm)))["role"] == "damage_spell")
     combo_lethal = (spell_dmg + max(0, my_atk_pw - len(op_c) * FALLBACK_PWR)) >= op_hp
     eff_edge     = "WINNING" if combo_lethal else edge_mode
 
-    if parsed["resources"]:
-        actions.append({"type": "play_resource", "card_instance_id": parsed["resources"][0]})
+    # 1. Resource (always — +1 energy/turn compounding advantage)
+    for a in by_type.get("play_resource", []):
+        actions.append(_clean(a)); break
 
-    actions.extend(_decide_cards(parsed["cards"], my_idx, op_idx, hand,
-                                 my_pid, op_pid, op_hp, eff_edge, my_atk_pw, nm))
+    # 2. Cards — APEX HUNTER targeting via _decide_cards
+    pc = by_type.get("play_card", [])
+    if pc:
+        raw_cards = []
+        for a in pc:
+            cid = a.get("card_instance_id", "")
+            for tgt in (a.get("targets") or [None]):
+                raw_cards.append((cid, tgt))
+        actions.extend(_decide_cards(raw_cards, my_idx, op_idx, hand,
+                                     player_id, op_pid, op_hp, eff_edge, my_atk_pw, nm))
 
-    chosen = _decide_attack(parsed["da_groups"], my_hp, op_hp, my_idx, op_c,
-                            danger, aggro, edge_mode, momentum, stall)
-    if chosen:
-        actions.append({"type": "declare_attackers", "attacker_ids": chosen})
+    # 3. Attackers — APEX HUNTER aggression
+    da = by_type.get("declare_attackers", [])
+    if da:
+        da_groups = [a.get("attacker_ids", []) for a in da if a.get("attacker_ids")]
+        chosen = _decide_attack(da_groups, my_hp, op_hp, my_idx, op_c,
+                                danger, aggro, eff_edge, momentum, stall)
+        if chosen:
+            actions.append({"type": "declare_attackers", "attacker_ids": chosen})
 
-    actions.append(end_turn)
+    actions.append({"type": "pass"})
     return actions
 
 
@@ -789,10 +829,9 @@ async def play_game_loop(arena: ShardsArena, game_id: str, player_id: str) -> di
         last_op_hp, last_my_hp = op_hp, my_hp
 
         my_c   = _extract_creatures(me); op_c  = _extract_creatures(op)
-        hand   = _extract_hand(me)
-        my_pid = player_id;              op_pid = ("p2" if player_id == "p1" else "p1")
         op_hs  = _hand_size(op)
 
+        hand   = _extract_hand(me)
         hp_hist.append(my_hp)
         stall = (len(hp_hist) >= 6
                  and max(hp_hist[-6:]) - min(hp_hist[-6:]) == 0
@@ -802,8 +841,8 @@ async def play_game_loop(arena: ShardsArena, game_id: str, player_id: str) -> di
         edge_hist.append(edge)
         momentum = _momentum(edge_hist)
 
-        actions = _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
-                               my_pid, op_pid, danger, aggro, edge_mode, momentum, stall)
+        actions = _build_turn(lg, raw_state, player_id,
+                              danger, aggro, edge_mode, momentum, stall)
         clean   = [{k: v for k, v in a.items() if k != "_FORCED"} for a in actions]
 
         log.info("Arena submitting %d actions: %s  edge=%s/%s",
