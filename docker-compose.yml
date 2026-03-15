@@ -1,0 +1,13 @@
+services:
+  fleet:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data      # persistent encrypted state
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

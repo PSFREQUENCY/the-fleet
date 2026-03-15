@@ -29,7 +29,11 @@ skills  = SkillTree()
 game    = ShardsGame()
 oracle  = Oracle(C.VENICE_KEY)
 pulse   = Pulse(C.HEARTBEAT_SEC, C.SLEEP_SEC)
-_key: bytes | None = None
+_key:         bytes | None = None
+_app:         object       = None   # set in main(), used by wake notify
+_sleeping:    bool         = False
+_last_active: float        = time.time()
+_WAKE_FILE    = Path(".wake")       # touch .wake in terminal to awaken
 
 # ── State persistence (AES-256-GCM encrypted JSON) ────────────────────────────
 def _save() -> None:
@@ -39,35 +43,45 @@ def _save() -> None:
             "scores": arbiter.scores[-500:],
             "prices": {k: v[-100:] for k, v in arbiter.price_history.items()},
         },
-        "skills": skills.to_dict(),
-        "game":   game.to_dict(),
-        "meta":   {"saved": time.time(), "gen": skills.generation,
-                   "oracle_tokens": oracle.stats["tokens_used"]},
+        "skills":       skills.to_dict(),
+        "game":         game.to_dict(),
+        "meta": {
+            "saved":         time.time(),
+            "last_active":   _last_active,
+            "gen":           skills.generation,
+            "oracle_tokens": oracle.stats["tokens_used"],
+            "sleeping":      _sleeping,
+        },
     }
     raw  = json.dumps(state, default=list).encode()
     blob = encrypt(_key, raw) if _key else raw
     Path(C.DB_PATH).write_bytes(blob)
 
 
-def _load() -> None:
-    global cortex, arbiter, skills, game
+def _load() -> float:
+    """Load state. Returns seconds offline (0 if first boot)."""
+    global cortex, arbiter, skills, game, _last_active, _sleeping
     p = Path(C.DB_PATH)
     if not p.exists():
-        return
+        return 0.0
     try:
         raw  = p.read_bytes()
         data = json.loads(decrypt(_key, raw) if _key else raw)
-        cortex  = Cortex.from_dict(data.get("cortex", {}),
-                                   C.MAX_STM, C.DECAY_RATE)
+        cortex  = Cortex.from_dict(data.get("cortex", {}), C.MAX_STM, C.DECAY_RATE)
         skills  = SkillTree.from_dict(data.get("skills", {}))
         game    = ShardsGame.from_dict(data.get("game", {}))
         ab = data.get("arbiter", {})
-        arbiter.scores         = ab.get("scores", [])
-        arbiter.price_history  = ab.get("prices", {})
-        log.info(f"Loaded: {len(cortex.nodes)} memories  "
-                 f"gen:{skills.generation}  shards:{sum(len(p.shards) for p in game.players.values())}")
+        arbiter.scores        = ab.get("scores", [])
+        arbiter.price_history = ab.get("prices", {})
+        meta = data.get("meta", {})
+        _last_active = meta.get("last_active", time.time())
+        offline_sec  = max(0.0, time.time() - meta.get("saved", time.time()))
+        log.info(f"Loaded: {len(cortex.nodes)} memories  gen:{skills.generation}  "
+                 f"offline:{offline_sec/3600:.1f}h")
+        return offline_sec
     except Exception as e:
         log.error(f"Load failed: {e}")
+        return 0.0
 
 # ── Heartbeat & sleep ─────────────────────────────────────────────────────────
 async def _heartbeat() -> None:
@@ -76,9 +90,53 @@ async def _heartbeat() -> None:
     log.info(f"♥  beat:{pulse.stats['beats']}  mem:{len(cortex.nodes)}  pruned:{pruned}")
 
 
-async def _sleep_cycle() -> None:
-    log.info("💤 sleep cycle")
-    # Market data update
+async def _wake_cycle(offline_sec: float = 0.0) -> dict:
+    """Run on startup or /wake. Catch up on missed time, update, learn."""
+    global _last_active, _sleeping
+    report: dict = {"offline_h": round(offline_sec / 3600, 2)}
+
+    # 1. Apply bulk decay for missed heartbeats
+    missed = int(offline_sec / C.HEARTBEAT_SEC)
+    if missed > 0:
+        report["missed_beats"] = missed
+        pruned = 0
+        for node in list(cortex.nodes.values()):
+            if node.decay(missed):
+                cortex.nodes.pop(node.id, None)
+                pruned += 1
+        report["pruned"] = pruned
+        log.info(f"Wake: applied {missed} missed beats, pruned {pruned} memories")
+
+    # 2. Market update
+    prices = await _fetch_all_prices()
+    report["prices"] = {sym: f"${p:,.2f}" for sym, p in prices.items()}
+
+    # 3. Dream/consolidate
+    dream = cortex.dream()
+    report["promoted"] = dream.get("promoted", 0)
+
+    # 4. Skill XP for surviving offline
+    if offline_sec > 1800:
+        result = skills.use("CORTEX", 8)
+        if result:
+            report["skill_up"] = result
+
+    # 5. Fleet earns shard for coming back online
+    shard = game.fleet_earn(f"wake_{int(time.time())}")
+    if shard:
+        report["shard"] = f"{shard.emoji}{shard.rarity} {shard.type}"
+        cortex.store(f"Fleet awakened after {offline_sec/3600:.1f}h offline. "
+                     f"Earned {shard.rarity} {shard.type} shard.",
+                     ["fleet", "wake", "shard", shard.type.lower()])
+
+    _last_active = time.time()
+    _sleeping    = False
+    pulse.wake()
+    _save()
+    return report
+
+
+async def _fetch_all_prices() -> dict:
     prices = {}
     try:
         import aiohttp
@@ -99,11 +157,55 @@ async def _sleep_cycle() -> None:
                             prices[sym] = p
                             arbiter.tick(sym, p)
     except Exception as e:
-        log.warning(f"market: {e}")
-    # Memory consolidation
+        log.warning(f"price fetch: {e}")
+    return prices
+
+
+async def _check_wake_file() -> None:
+    """Poll for terminal wake: `touch .wake` on the server."""
+    global _sleeping
+    while True:
+        if _WAKE_FILE.exists():
+            _WAKE_FILE.unlink(missing_ok=True)
+            if _sleeping:
+                log.info("Wake file detected — awakening")
+                report = await _wake_cycle(0.0)
+                # Try to notify via bot if possible
+                if _app:
+                    try:
+                        chat_id = Path(".chat_id").read_text().strip()
+                        await _app.bot.send_message(
+                            chat_id=int(chat_id),
+                            text=_fmt_wake_report(report, source="terminal")
+                        )
+                    except Exception:
+                        pass
+        await asyncio.sleep(30)
+
+
+def _fmt_wake_report(r: dict, source: str = "telegram") -> str:
+    lines = [f"⚡ FLEET ONLINE  [{source.upper()}]"]
+    if r.get("offline_h"):
+        lines.append(f"Offline:   {r['offline_h']}h")
+    if r.get("missed_beats"):
+        lines.append(f"Missed HB: {r['missed_beats']}  Pruned: {r.get('pruned',0)} memories")
+    if r.get("promoted"):
+        lines.append(f"Promoted:  {r['promoted']} STM → LTM")
+    if r.get("prices"):
+        lines.append("Market:    " + "  ".join(f"{s}:{p}" for s, p in r["prices"].items()))
+    if r.get("skill_up"):
+        lines.append(r["skill_up"])
+    if r.get("shard"):
+        lines.append(f"Earned:    {r['shard']} SHARD")
+    lines.append(f"Gen:{skills.generation}  Power:{skills.power():.0f}  Mem:{len(cortex.nodes)}")
+    return "\n".join(lines)
+
+
+async def _sleep_cycle() -> None:
+    log.info("💤 sleep cycle")
+    await _fetch_all_prices()
     d = cortex.dream()
     log.info(f"dream: {d}")
-    # Fleet earns shard for surviving a sleep cycle
     s = game.fleet_earn(f"sleep_{pulse.stats['sleep_cycles']}")
     if s:
         cortex.store(f"Fleet earned {s.rarity} {s.type} shard in sleep cycle",
@@ -393,13 +495,42 @@ async def cmd_top(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_pulse(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     ps = pulse.stats
+    mode = "😴 SLEEPING" if ps["sleeping"] else "⚡ ACTIVE"
     await _reply(upd,
-        f"♥  PULSE\n"
+        f"♥  PULSE  [{mode}]\n"
         f"Beats:      {ps['beats']}\n"
         f"Sleep:      {ps['sleep_cycles']}\n"
         f"Next HB:    {ps['next_hb_in']}s\n"
         f"Next sleep: {ps['next_sleep_in']}s"
     )
+
+
+async def cmd_sleep(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    global _sleeping, _last_active
+    _sleeping    = True
+    _last_active = time.time()
+    pulse.sleep()
+    _save()
+    # Save chat_id so terminal wake can notify here
+    Path(".chat_id").write_text(str(upd.effective_chat.id))
+    await _reply(upd,
+        f"😴 FLEET RESTING\n"
+        f"Heartbeat suspended. Memories will decay naturally.\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"To wake:\n"
+        f"  Telegram: /wake\n"
+        f"  Terminal: touch .wake\n"
+        f"  Restart:  automatic on next boot"
+    )
+
+
+async def cmd_wake(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    global _sleeping, _last_active
+    was_sleeping = _sleeping
+    offline_sec  = max(0.0, time.time() - _last_active) if was_sleeping else 0.0
+    await _reply(upd, "⚡ Awakening fleet..." if was_sleeping else "⚡ Already awake — running update cycle...")
+    report = await _wake_cycle(offline_sec)
+    await _reply(upd, _fmt_wake_report(report, source="telegram"))
 
 
 # ── Passive message analysis ──────────────────────────────────────────────────
@@ -419,7 +550,7 @@ async def on_message(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    global _key
+    global _key, _app
     if not C.BOT_TOKEN:
         raise RuntimeError("FLEET_TOKEN not set")
     if C.MASTER_KEY:
@@ -428,7 +559,8 @@ def main() -> None:
             log.info("Cipher key derived — state encrypted")
         except Exception as e:
             log.warning(f"Invalid FLEET_KEY ({e}) — running unencrypted")
-    _load()
+
+    offline_sec = _load()
 
     # Wire pulse
     pulse.on_heartbeat(_heartbeat)
@@ -436,6 +568,7 @@ def main() -> None:
 
     # Build app
     app = Application.builder().token(C.BOT_TOKEN).build()
+    _app = app
 
     CMD_MAP = [
         ("start",       cmd_start,       "Wake the fleet"),
@@ -455,7 +588,9 @@ def main() -> None:
         ("forge",       cmd_forge,       "Forge shards together"),
         ("battle",      cmd_battle,      "Battle for shards"),
         ("top",         cmd_top,         "Shards leaderboard"),
-        ("pulse",       cmd_pulse,       "Heartbeat status"),
+        ("pulse",       cmd_pulse,       "Heartbeat + sleep status"),
+        ("sleep",       cmd_sleep,       "Put fleet to rest"),
+        ("wake",        cmd_wake,        "Wake fleet + run update cycle"),
     ]
 
     for cmd, handler, _ in CMD_MAP:
@@ -467,6 +602,11 @@ def main() -> None:
             [BotCommand(cmd, desc) for cmd, _, desc in CMD_MAP]
         )
         asyncio.ensure_future(pulse.start())
+        asyncio.ensure_future(_check_wake_file())
+        # Startup learning cycle — catch up on offline time
+        if offline_sec > 60:
+            log.info(f"Running startup wake cycle ({offline_sec/3600:.1f}h offline)")
+            asyncio.ensure_future(_wake_cycle(offline_sec))
         log.info(f"Fleet online — gen:{skills.generation}  mem:{len(cortex.nodes)}")
 
     app.post_init = post_init
