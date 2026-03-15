@@ -151,11 +151,15 @@ class ShardsArena:
                     data = await r.json()
                     if not r.ok:
                         log.warning("POST %s -> %s", path, r.status)
-                        return {"error": str(data), "status": r.status}
+                        if isinstance(data, dict):
+                            data.setdefault("error", data.get("message", f"HTTP {r.status}"))
+                            data["_status"] = r.status
+                            return data
+                        return {"error": str(data), "_status": r.status}
                     return data
         except Exception as e:
             log.warning("POST %s error: %s", path, e)
-            return {"error": str(e), "status": 0}
+            return {"error": str(e), "_status": 0}
 
     async def _delete(self, path) -> dict:
         try:
@@ -275,7 +279,7 @@ def _is_my_turn(state: dict, my_pid: str) -> bool:
         v = state.get(f)
         if v is True: return True
         if isinstance(v, str) and v.lower() in ("true", "1", "yes", "you"): return True
-    for f in ("actor", "current_player", "active_player", "whos_turn", "turn_player"):
+    for f in ("ap", "actor", "current_player", "active_player", "whos_turn", "turn_player"):
         if state.get(f) and str(state[f]) == my_pid: return True
     ns = state.get("new_state", "")
     if isinstance(ns, str) and ns:
@@ -312,9 +316,9 @@ def _extract_hand(p: dict) -> list:
     return []
 
 def _hand_size(op: dict) -> int:
-    for k in ("hand_size", "hand_count", "hc", "hs"):
+    for k in ("hand_size", "hand_count", "hc", "hs", "h"):
         v = op.get(k)
-        if v is not None:
+        if v is not None and not isinstance(v, (list, dict)):
             try: return int(v)
             except: pass
     return len(_extract_hand(op)) or 3
@@ -325,7 +329,12 @@ def _cid(c: dict) -> str:
         if v: return str(v)
     return ""
 
-def _cname(c: dict) -> str:
+def _cname(c: dict, name_map: dict = None) -> str:
+    # Prefer name_map (populated from legal action descriptions)
+    if name_map:
+        iid = c.get("iid") or c.get("id") or c.get("instance_id") or c.get("card_instance_id")
+        if iid and iid in name_map:
+            return name_map[iid]
     for k in ("name", "n", "card_name", "title", "nm", "display_name", "type", "kind", "label"):
         v = c.get(k)
         if v and isinstance(v, str) and len(v) > 1 and not v.startswith("card_"):
@@ -413,8 +422,20 @@ def _make_pass(code="PA") -> dict:
 def _parse_legal(lg: list) -> dict:
     out = {"mulligan_keep": False, "mulligan_pass": False,
            "resources": [], "cards": [], "da_groups": [], "db_pairs": [],
-           "end_turn_code": "PA"}
-    for code in lg:
+           "end_turn_code": "PA", "_name_map": {}}
+    for item in lg:
+        # REST API returns action dicts; legacy/CLI returns code strings
+        if isinstance(item, dict):
+            code = item.get("code", "")
+            # Extract card name from description for CARD_DB lookup
+            desc = item.get("description", "")
+            cid  = item.get("card_instance_id", "")
+            if cid and desc.startswith("Play "):
+                out["_name_map"][cid] = desc[5:]
+        elif isinstance(item, str):
+            code = item
+        else:
+            continue
         code = code.strip()
         if not code: continue
         if code == "MK":           out["mulligan_keep"] = True
@@ -480,7 +501,7 @@ def _score_target(zone, role, op_idx, my_idx, tid, edge_mode, my_atk_pw):
     return 999
 
 def _decide_cards(raw_cards, my_idx, op_idx, hand, my_pid, op_pid,
-                  op_hp, edge_mode, my_atk_pw):
+                  op_hp, edge_mode, my_atk_pw, name_map=None):
     hand_idx = {_cid(c): c for c in hand if _cid(c)}
     tgt_map  = collections.defaultdict(list)
     for (card_id, tgt) in raw_cards: tgt_map[card_id].append(tgt)
@@ -492,13 +513,13 @@ def _decide_cards(raw_cards, my_idx, op_idx, hand, my_pid, op_pid,
     else:
         pri = {"removal":0,"creature":1,"damage_spell":2,"buff":3,"draw":4,"heal":5,"utility":6}
 
-    def sort_key(cid_): return pri.get(lookup_card(_cname(hand_idx.get(cid_, {})))["role"], 6)
+    def sort_key(cid_): return pri.get(lookup_card(_cname(hand_idx.get(cid_, {}), name_map))["role"], 6)
 
     actions, seen = [], set()
     for card_id in sorted(tgt_map, key=sort_key):
         if card_id in seen: continue
         card     = hand_idx.get(card_id, {})
-        info     = lookup_card(_cname(card))
+        info     = lookup_card(_cname(card, name_map))
         role     = info["role"]
         tgt_rule = info["targets"]
         targets  = tgt_map[card_id]
@@ -616,6 +637,7 @@ def _decide_attack(da_groups, my_hp, op_hp, my_idx, op_c, danger, aggro, edge_mo
 def _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
                 my_pid, op_pid, danger, aggro, edge_mode, momentum, stall):
     parsed   = _parse_legal(lg)
+    nm       = parsed.get("_name_map", {})
     end_turn = _make_pass(parsed["end_turn_code"])
 
     if parsed["mulligan_keep"] or parsed["mulligan_pass"]:
@@ -632,8 +654,8 @@ def _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
     my_atk_pw = (sum(_cpow(my_idx.get(a, {})) for g in parsed["da_groups"] for a in g)
                  if parsed["da_groups"] else sum(_cpow(c) for c in my_c))
 
-    spell_dmg    = sum(lookup_card(_cname(c)).get("value", 2) for c in hand
-                       if lookup_card(_cname(c))["role"] == "damage_spell")
+    spell_dmg    = sum(lookup_card(_cname(c, nm)).get("value", 2) for c in hand
+                       if lookup_card(_cname(c, nm))["role"] == "damage_spell")
     combo_lethal = (spell_dmg + max(0, my_atk_pw - len(op_c) * FALLBACK_PWR)) >= op_hp
     eff_edge     = "WINNING" if combo_lethal else edge_mode
 
@@ -641,7 +663,7 @@ def _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
         actions.append({"type": "play_resource", "card_instance_id": parsed["resources"][0]})
 
     actions.extend(_decide_cards(parsed["cards"], my_idx, op_idx, hand,
-                                 my_pid, op_pid, op_hp, eff_edge, my_atk_pw))
+                                 my_pid, op_pid, op_hp, eff_edge, my_atk_pw, nm))
 
     chosen = _decide_attack(parsed["da_groups"], my_hp, op_hp, my_idx, op_c,
                             danger, aggro, edge_mode, momentum, stall)
@@ -693,20 +715,40 @@ async def play_game_loop(arena: ShardsArena, game_id: str, player_id: str) -> di
 
     for _ in range(max_turns):
         await asyncio.sleep(2)
-        state = await arena.get_game(game_id)
+        raw = await arena.get_game(game_id)
 
-        if state.get("error"):
+        if raw.get("error"):
             errs += 1
             if errs >= MAX_ERRORS:
                 await arena.login(); errs = 0
             continue
         errs = 0
 
+        # Outer status check (game completed/finished)
+        outer_status = raw.get("status", "")
+        if outer_status in ("completed", "finished", "ended", "game_over"):
+            summary = await arena.get_summary(game_id)
+            winner  = str(summary.get("winner") or summary.get("winner_id", ""))
+            winner2 = str(summary.get("winner_agent_id", ""))
+            result["outcome"] = ("win"
+                if (player_id in winner or account.agent_id in winner
+                    or account.agent_id in winner2)
+                else "loss")
+            result["summary"] = summary
+            break
+
+        # REST API wraps game state under "state" key
+        state = raw.get("state", raw)
+
         phase = _get_phase(state)
         if _is_over(state, phase):
             summary = await arena.get_summary(game_id)
             winner  = str(summary.get("winner") or summary.get("winner_id", ""))
-            result["outcome"] = "win" if player_id in winner else "loss"
+            winner2 = str(summary.get("winner_agent_id", ""))
+            result["outcome"] = ("win"
+                if (player_id in winner or account.agent_id in winner
+                    or account.agent_id in winner2)
+                else "loss")
             result["summary"] = summary
             break
 

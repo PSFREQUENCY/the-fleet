@@ -437,14 +437,12 @@ async def _run_command(chat_id: int, command: str, args: list,
         if join.get("code") == "active_game" or (
                 "error" in join and "active game" in str(join.get("error", "")).lower()):
             # Already in a game — resume it
-            game_id   = join.get("game_id", "")
+            game_id = join.get("game_id", "")
             if not game_id:
                 await say(f"❌ Queue join failed: {join.get('error')}"); return
-            state     = await arena.get_game(game_id)
-            me        = state.get("me", {})
-            player_id = (me.get("pid") or me.get("id") or me.get("player_id")
-                         or arena_account.agent_id)
-            await say(f"⚔️ Resuming active game {game_id[:8]}...")
+            raw       = await arena.get_game(game_id)
+            player_id = ("p1" if raw.get("player1_id") == arena_account.agent_id else "p2")
+            await say(f"⚔️ Resuming active game {game_id[:8]}... (you are {player_id})")
         elif "error" in join:
             await say(f"❌ Queue join failed: {join.get('error')}"); return
         else:
@@ -455,6 +453,7 @@ async def _run_command(chat_id: int, command: str, args: list,
                 status = qs.get("status", "")
                 if status == "match_found":
                     game_id   = qs.get("game_id", "")
+                    # API returns positional id "p1"/"p2"
                     player_id = qs.get("your_player_id", "")
                     break
                 if status == "not_queued":
@@ -463,8 +462,11 @@ async def _run_command(chat_id: int, command: str, args: list,
             if not game_id:
                 await arena.leave_queue()
                 await say("⚔️ No match found — left queue."); return
+            if not player_id:
+                raw = await arena.get_game(game_id)
+                player_id = ("p1" if raw.get("player1_id") == arena_account.agent_id else "p2")
             opp = qs.get("opponent_name", "???")
-            await say(f"⚔️ Match found! vs {opp}\n🎮 Playing {mode} game...")
+            await say(f"⚔️ Match found! vs {opp}\n🎮 Playing {mode} game... (you are {player_id})")
         result = await play_game_loop(arena, game_id, str(player_id))
         if result["outcome"] == "win":
             arena_account.wins += 1
