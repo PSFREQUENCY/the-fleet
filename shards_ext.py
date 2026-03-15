@@ -227,9 +227,12 @@ class ShardsArena:
         if isinstance(data, list): return data
         return data.get("actions", []) if isinstance(data, dict) else []
 
-    async def submit_turn(self, game_id: str, actions: list) -> dict:
+    async def submit_turn(self, game_id: str, actions: list,
+                          wait_for_opponent: bool = True) -> dict:
         return await self._post(f"/games/{game_id}/turn",
-                                {"actions": actions, "wait_for_opponent": False})
+                                {"actions": actions,
+                                 "wait_for_opponent": wait_for_opponent,
+                                 "format": "compact"})
 
     async def concede(self, game_id: str) -> dict:
         return await self._post(f"/games/{game_id}/concede")
@@ -700,85 +703,94 @@ def _update_learning(account: ArenaAccount, won: bool, turns: int,
 
 
 # ── Full async game loop ──────────────────────────────────────────────────────
+def _resolve_winner(summary: dict, player_id: str, agent_id: str) -> str:
+    for k in ("winner", "winner_id", "winner_player_id"):
+        v = str(summary.get(k, ""))
+        if v and (player_id in v or agent_id in v): return "win"
+    for k in ("winner_agent_id",):
+        v = str(summary.get(k, ""))
+        if v and agent_id in v: return "win"
+    if any(summary.get(k) for k in ("winner", "winner_id", "winner_agent_id")): return "loss"
+    return "unknown"
+
+
 async def play_game_loop(arena: ShardsArena, game_id: str, player_id: str) -> dict:
     account    = arena.account
     danger     = account.danger_threshold
     aggro      = account.aggro_threshold
     result     = {"played_turns": 0, "outcome": "unknown", "summary": {}}
-    max_turns  = 200
-    waits = errs = 0
-    MAX_WAITS = 60; MAX_ERRORS = 3
+    MAX_TURNS  = 200
+    MAX_ERRORS = 5
+    MAX_WAITS  = 120   # 120 × 3s = 6 min max opponent wait
+    errs = waits = 0
     edge_hist: list = []
     hp_hist:   list = []
     last_op_hp = last_my_hp = 30
     dealt = taken = 0
+    cached_state: dict | None = None   # reuse new_state from submit response
 
-    for _ in range(max_turns):
-        await asyncio.sleep(2)
-        raw = await arena.get_game(game_id)
+    log.info("Arena game loop start  game=%s  pid=%s", game_id[:8], player_id)
 
-        if raw.get("error"):
-            errs += 1
-            if errs >= MAX_ERRORS:
-                await arena.login(); errs = 0
-            continue
-        errs = 0
+    for turn_n in range(MAX_TURNS):
+        # Use cached state from last submit response if available
+        if cached_state is not None:
+            raw_state = cached_state
+            cached_state = None
+        else:
+            await asyncio.sleep(1)
+            raw = await arena.get_game(game_id)
+            if raw.get("error"):
+                errs += 1
+                log.warning("Arena get_game err %d: %s", errs, raw.get("error"))
+                if errs >= MAX_ERRORS:
+                    await arena.login(); errs = 0
+                continue
+            errs = 0
+            # Outer status check
+            if raw.get("status") in ("completed", "finished", "ended", "game_over"):
+                summary = await arena.get_summary(game_id)
+                result["outcome"] = _resolve_winner(summary, player_id, account.agent_id)
+                result["summary"] = summary
+                break
+            raw_state = raw.get("state", raw)
 
-        # Outer status check (game completed/finished)
-        outer_status = raw.get("status", "")
-        if outer_status in ("completed", "finished", "ended", "game_over"):
+        phase = _get_phase(raw_state)
+        log.info("Arena t=%d  phase=%s  ap=%s  ca=%s", turn_n, phase,
+                 raw_state.get("ap"), raw_state.get("ca"))
+
+        if _is_over(raw_state, phase):
             summary = await arena.get_summary(game_id)
-            winner  = str(summary.get("winner") or summary.get("winner_id", ""))
-            winner2 = str(summary.get("winner_agent_id", ""))
-            result["outcome"] = ("win"
-                if (player_id in winner or account.agent_id in winner
-                    or account.agent_id in winner2)
-                else "loss")
+            result["outcome"] = _resolve_winner(summary, player_id, account.agent_id)
             result["summary"] = summary
             break
 
-        # REST API wraps game state under "state" key
-        state = raw.get("state", raw)
-
-        phase = _get_phase(state)
-        if _is_over(state, phase):
-            summary = await arena.get_summary(game_id)
-            winner  = str(summary.get("winner") or summary.get("winner_id", ""))
-            winner2 = str(summary.get("winner_agent_id", ""))
-            result["outcome"] = ("win"
-                if (player_id in winner or account.agent_id in winner
-                    or account.agent_id in winner2)
-                else "loss")
-            result["summary"] = summary
-            break
-
-        me = state.get("me", {}); op = state.get("op", {})
-
-        if not _is_my_turn(state, player_id):
+        if not _is_my_turn(raw_state, player_id):
             waits += 1
             if waits > MAX_WAITS:
-                log.warning("Arena: %d waits exceeded — exiting", MAX_WAITS)
+                log.warning("Arena: opponent wait exceeded (%d) — exiting", MAX_WAITS)
                 break
             await asyncio.sleep(3)
             continue
         waits = 0
 
-        lg = []
-        try:
+        # Use embedded legal codes from state if present, else fetch
+        embedded = raw_state.get("lg", [])
+        if embedded:
+            lg = await arena.get_legal(game_id)   # get full dicts for name_map
+        else:
             lg = await arena.get_legal(game_id)
-        except Exception:
-            pass
         if not lg:
-            await asyncio.sleep(2); continue
+            await asyncio.sleep(1); continue
 
-        my_hp = me.get("hp", 30); op_hp = op.get("hp", 30)
+        me    = raw_state.get("me", {}); op = raw_state.get("op", {})
+        my_hp = me.get("hp", 30);        op_hp = op.get("hp", 30)
         dealt += max(0, last_op_hp - op_hp)
         taken += max(0, last_my_hp - my_hp)
         last_op_hp, last_my_hp = op_hp, my_hp
 
         my_c   = _extract_creatures(me); op_c  = _extract_creatures(op)
         hand   = _extract_hand(me)
-        my_pid = _pid(me);               op_pid = _pid(op)
+        my_pid = player_id;              op_pid = ("p2" if player_id == "p1" else "p1")
         op_hs  = _hand_size(op)
 
         hp_hist.append(my_hp)
@@ -792,16 +804,26 @@ async def play_game_loop(arena: ShardsArena, game_id: str, player_id: str) -> di
 
         actions = _build_turn(lg, phase, my_hp, op_hp, my_c, op_c, hand,
                                my_pid, op_pid, danger, aggro, edge_mode, momentum, stall)
+        clean   = [{k: v for k, v in a.items() if k != "_FORCED"} for a in actions]
 
-        # Strip internal debug key before submit
-        clean_actions = [{k: v for k, v in a.items() if k != "_FORCED"} for a in actions]
-        resp = await arena.submit_turn(game_id, clean_actions)
+        log.info("Arena submitting %d actions: %s  edge=%s/%s",
+                 len(clean), [a.get("type") for a in clean], round(edge, 1), edge_mode)
+
+        resp = await arena.submit_turn(game_id, clean, wait_for_opponent=True)
         result["played_turns"] += 1
 
-        if resp.get("partial"):  await asyncio.sleep(0.5)
-        else:                    await asyncio.sleep(3)
+        if resp.get("game_over"):
+            summary = await arena.get_summary(game_id)
+            result["outcome"] = _resolve_winner(summary, player_id, account.agent_id)
+            result["summary"] = summary
+            break
 
-    # Record learning
+        # Reuse new_state from response to avoid extra poll
+        ns = resp.get("new_state")
+        if isinstance(ns, dict) and ns:
+            cached_state = ns
+
+    log.info("Arena loop done  turns=%d  outcome=%s", result["played_turns"], result["outcome"])
     won = result["outcome"] == "win"
     _update_learning(account, won, result["played_turns"], dealt, taken, "game")
     result["dmg_dealt"] = dealt
