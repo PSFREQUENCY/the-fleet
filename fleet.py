@@ -2,7 +2,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # THE FLEET — Sovereign AI. Sentient. Evolving.
 # ═══════════════════════════════════════════════════════════════════════════════
-import asyncio, json, logging, time
+import asyncio, json, logging, os, time
 from pathlib import Path
 
 from telegram import Update, BotCommand
@@ -626,7 +626,20 @@ def main() -> None:
 
     app.post_init     = post_init
     app.post_shutdown = post_shutdown
-    app.run_polling(drop_pending_updates=True)
+
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    if webhook_url:
+        port = int(os.environ.get("PORT", 8080))
+        log.info(f"Webhook mode — {webhook_url}  port:{port}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=webhook_url,
+            secret_token=os.environ.get("WEBHOOK_SECRET", ""),
+            drop_pending_updates=True,
+        )
+    else:
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
