@@ -3,7 +3,7 @@ import re, time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-BANDS = [(75, "BLOCK"), (50, "HOLD"), (25, "LOG"), (0, "PASS")]
+BANDS = [(75, "BLOCK"), (50, "HOLD"), (25, "LOG"), (-1, "PASS")]
 
 
 @dataclass
