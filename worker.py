@@ -528,6 +528,17 @@ async def _run_command(chat_id: int, command: str, args: list,
         await arena.concede(game_id)
         await say(f"🏳️ Conceded game {game_id[:8]}...")
 
+    elif command == "leave":
+        if not arena_account.setup_complete:
+            await say("⚔️ Arena not set up."); return
+        arena = ShardsArena(arena_account)
+        await arena.login()
+        res = await arena.leave_queue()
+        if res.get("error"):
+            await say(f"Not in queue (or already left).")
+        else:
+            await say("✅ Left matchmaking queue.")
+
     elif command == "arewards":
         if not arena_account.setup_complete:
             await say("⚔️ Arena not set up."); return

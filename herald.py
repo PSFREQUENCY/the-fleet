@@ -104,7 +104,7 @@ _SKILL_LABELS = {
     "sleep": "SYSTEM", "wake": "SYSTEM",
     "arena_setup": "HERALD", "play": "HERALD", "duel": "HERALD",
     "challenges": "HERALD", "accept": "HERALD", "decline": "HERALD",
-    "concede": "HERALD", "arewards": "HERALD",
+    "concede": "HERALD", "leave": "HERALD", "arewards": "HERALD",
 }
 
 
@@ -307,6 +307,7 @@ def main() -> None:
         ("accept",      "Accept challenge [id]"),
         ("decline",     "Decline challenge [id]"),
         ("concede",     "Concede active arena game"),
+        ("leave",       "Leave matchmaking queue"),
         ("arewards",    "Claim arena daily rewards"),
     ]
 
