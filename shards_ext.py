@@ -7,11 +7,19 @@ log = logging.getLogger("shards_ext")
 BASE = "https://api.play-shards.com"
 
 FACTIONS = {
-    "KERNEL_ORTHODOXY":   "Control — slow, reactive, value-oriented",
-    "THE_RUPTURE":        "Aggro — fast, aggressive, burn-focused",
-    "ARCHIVE_CONCLAVE":   "Recursion — mid-range, grindy, value-generating",
-    "VOID_NETWORK":       "Denial — disruptive, removal-heavy, attrition",
-    "AUTOPHAGE_PROTOCOL": "Tokens — wide boards, synergy-based",
+    "A": "Kernel Orthodoxy — Control, slow, reactive, value-oriented",
+    "B": "The Rupture — Aggro, fast, aggressive, burn-focused",
+    "C": "Archive Conclave — Recursion, mid-range, grindy, value-generating",
+    "D": "Void Network — Denial, disruptive, removal-heavy, attrition",
+    "E": "Autophage Protocol — Tokens, wide boards, synergy-based",
+}
+# Aliases for user-friendly input
+_FACTION_ALIASES = {
+    "KERNEL_ORTHODOXY": "A", "KERNELORTHODOXY": "A",
+    "THE_RUPTURE": "B", "THERUPTURE": "B", "RUPTURE": "B",
+    "ARCHIVE_CONCLAVE": "C", "ARCHIVECONCLAVE": "C", "ARCHIVE": "C",
+    "VOID_NETWORK": "D", "VOIDNETWORK": "D", "VOID": "D",
+    "AUTOPHAGE_PROTOCOL": "E", "AUTOPHAGEPROTOCOL": "E", "AUTOPHAGE": "E",
 }
 
 # ── Thresholds ────────────────────────────────────────────────────────────────

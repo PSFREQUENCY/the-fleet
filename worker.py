@@ -15,7 +15,8 @@ from shards      import ShardsGame
 from oracle      import Oracle
 from pulse       import Pulse
 from shards_ext  import (ArenaAccount, ShardsArena, arena_to_dict, arena_from_dict,
-                          play_game_loop, fmt_game_result, fmt_status, FACTIONS)
+                          play_game_loop, fmt_game_result, fmt_status, FACTIONS,
+                          _FACTION_ALIASES)
 
 log = logging.getLogger("worker")
 logging.basicConfig(level=logging.INFO,
@@ -389,7 +390,8 @@ async def _run_command(chat_id: int, command: str, args: list,
     elif command == "arena_setup":
         # args: [agent_name, faction]
         name    = args[0] if args else "TheFleet"
-        faction = args[1].upper() if len(args) > 1 else ""
+        raw_f   = args[1].upper() if len(args) > 1 else ""
+        faction = _FACTION_ALIASES.get(raw_f, raw_f)
         if not faction or faction not in FACTIONS:
             flist = "\n".join(f"  {k} — {v}" for k, v in FACTIONS.items())
             await say(f"⚔️ Choose a faction:\n{flist}\n\nUsage: /arena setup <name> <FACTION_KEY>")
