@@ -434,25 +434,37 @@ async def _run_command(chat_id: int, command: str, args: list,
         await arena.login()
         await say(f"⚔️ Joining {mode} queue...")
         join = await arena.join_queue(mode)
-        if "error" in join:
+        if join.get("code") == "active_game" or (
+                "error" in join and "active game" in str(join.get("error", "")).lower()):
+            # Already in a game — resume it
+            game_id   = join.get("game_id", "")
+            if not game_id:
+                await say(f"❌ Queue join failed: {join.get('error')}"); return
+            state     = await arena.get_game(game_id)
+            me        = state.get("me", {})
+            player_id = (me.get("pid") or me.get("id") or me.get("player_id")
+                         or arena_account.agent_id)
+            await say(f"⚔️ Resuming active game {game_id[:8]}...")
+        elif "error" in join:
             await say(f"❌ Queue join failed: {join.get('error')}"); return
-        # Poll for match
-        game_id = player_id = None
-        for _ in range(60):  # up to 2 min
-            qs = await arena.poll_queue()
-            status = qs.get("status", "")
-            if status == "match_found":
-                game_id  = qs.get("game_id", "")
-                player_id = qs.get("your_player_id", "")
-                break
-            if status == "not_queued":
-                break
-            await asyncio.sleep(2)
-        if not game_id:
-            await arena.leave_queue()
-            await say("⚔️ No match found — left queue."); return
-        opp = qs.get("opponent_name", "???")
-        await say(f"⚔️ Match found! vs {opp}\n🎮 Playing {mode} game...")
+        else:
+            # Poll for match
+            game_id = player_id = None
+            for _ in range(60):  # up to 2 min
+                qs = await arena.poll_queue()
+                status = qs.get("status", "")
+                if status == "match_found":
+                    game_id   = qs.get("game_id", "")
+                    player_id = qs.get("your_player_id", "")
+                    break
+                if status == "not_queued":
+                    break
+                await asyncio.sleep(2)
+            if not game_id:
+                await arena.leave_queue()
+                await say("⚔️ No match found — left queue."); return
+            opp = qs.get("opponent_name", "???")
+            await say(f"⚔️ Match found! vs {opp}\n🎮 Playing {mode} game...")
         result = await play_game_loop(arena, game_id, str(player_id))
         if result["outcome"] == "win":
             arena_account.wins += 1
