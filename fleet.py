@@ -533,6 +533,12 @@ async def cmd_wake(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(upd, _fmt_wake_report(report, source="telegram"))
 
 
+# ── Chat ID capture (saves on every interaction for terminal-wake notify) ─────
+async def _save_chat_id(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if upd.effective_chat:
+        Path(".chat_id").write_text(str(upd.effective_chat.id))
+
+
 # ── Passive message analysis ──────────────────────────────────────────────────
 async def on_message(upd: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not upd.message or not upd.message.text:
@@ -596,6 +602,7 @@ def main() -> None:
     for cmd, handler, _ in CMD_MAP:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.ALL, _save_chat_id))
 
     _tasks: list = []
 
@@ -624,3 +631,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
